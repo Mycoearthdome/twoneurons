@@ -1,19 +1,25 @@
+use ndarray::concatenate;
 use ndarray::prelude::*;
+use ndarray_rand::rand::rngs::StdRng;
+use ndarray_rand::rand::SeedableRng;
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
-use rand::thread_rng;
-use ndarray::concatenate;
+use serde::{Serialize, Deserialize};
+use std::fs::File;
+use std::io::{self, Write, Read};
+use std::path::Path;
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct NeuralNetwork {
-    weights: Vec<Array2<f64>>,  // List of weight matrices for each layer
-    biases: Vec<Array1<f64>>,   // List of bias vectors for each layer
-    neuron_counts: Vec<usize>,  // Neuron count for each layer
+    weights: Vec<Array2<f64>>,
+    biases: Vec<Array1<f64>>,
+    neuron_counts: Vec<usize>,
+    problem: bool, // True only if coherence error
 }
 
 impl NeuralNetwork {
     fn new(neuron_counts: Vec<usize>) -> NeuralNetwork {
-        let mut rng = thread_rng();
+        let mut rng: StdRng = StdRng::from_entropy();
         let mut weights = Vec::new();
         let mut biases = Vec::new();
 
@@ -25,10 +31,9 @@ impl NeuralNetwork {
             );
             let bias = Array1::<f64>::random_using(
                 neuron_counts[i + 1],
-                Uniform::new(-0.1, 0.1), // Initialize biases to small random values
+                Uniform::new(-0.1, 0.1),
                 &mut rng,
             );
-
             weights.push(weight);
             biases.push(bias);
         }
@@ -37,152 +42,237 @@ impl NeuralNetwork {
             weights,
             biases,
             neuron_counts,
+            problem: false,
         }
+    }
+
+    fn relu(x: &Array1<f64>) -> Array1<f64> {
+        x.mapv(|x| x.max(0.0))
+    }
+
+    fn relu_derivative(x: &Array1<f64>) -> Array1<f64> {
+        x.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 })
     }
 
     fn forward(&self, input: &Array1<f64>) -> Array1<f64> {
-        let mut activation = input.clone(); // Start with the input as the first activation
-
+        let mut activation = input.clone();
         for (i, (weight, bias)) in self.weights.iter().zip(&self.biases).enumerate() {
-            let weighted_input = weight.dot(&activation); // Matrix multiplication
-            let weighted_input_with_bias = weighted_input + bias; // Add bias
-            let new_activation = weighted_input_with_bias.map(|x| x.max(0.0)); // ReLU activation
-            activation = new_activation;
+            let z = weight.dot(&activation) + bias;
+            if i == self.weights.len() - 1 {
+                // Output layer (no softmax, using MSE loss)
+                activation = z;
+            } else {
+                activation = Self::relu(&z);
+            }
         }
-
         activation
     }
 
-    fn train(&mut self, inputs: &Array2<f64>, outputs: &Array2<f64>, epochs: usize, initial_learning_rate: f64, error_threshold: f64) {
-        let mut learning_rate = initial_learning_rate;
-        
-        for epoch in 0..epochs {
-            for (input, output) in inputs.rows().into_iter().zip(outputs.rows()) {
+    fn train(
+        &mut self,
+        inputs: &Array2<f64>,
+        outputs: &Array2<f64>,
+        epochs: usize,
+        mut learning_rate: f64,
+        error_threshold: f64,
+        logic_gate_name: &str,
+    ) {
+        self.problem = false;
+        for _epoch in 0..epochs {
+            for (input, output) in inputs.outer_iter().zip(outputs.outer_iter()) {
                 let input = input.to_owned();
                 let output = output.to_owned();
-        
+
+                let mut activations = vec![input.clone()];
+                let mut zs = Vec::new();
+
                 // Forward pass
                 let mut activation = input.clone();
-                let mut activations = Vec::new();
-                let mut zs = Vec::new();
-        
-                for (weight, bias) in self.weights.iter().zip(&self.biases) {
+                for (i, (weight, bias)) in self.weights.iter().zip(&self.biases).enumerate() {
                     let z = weight.dot(&activation) + bias;
                     zs.push(z.clone());
-                    let activation_val = if zs.len() < self.weights.len() {
-                        z.map(|x| x.max(0.0))  // ReLU for hidden layers
+                    activation = if i == self.weights.len() - 1 {
+                        z
                     } else {
-                        let exp_vals = z.mapv(|x| x.exp()); // Apply exp to each element for Softmax
-                        let sum_exp_vals = exp_vals.sum();
-                        exp_vals / sum_exp_vals // Normalize to get probabilities
+                        Self::relu(&z)
                     };
-                    activations.push(activation_val.clone());
-                    activation = activation_val;
+                    activations.push(activation.clone());
                 }
-        
-                // Backpropagation
-                let mut deltas = Vec::new();
-                let mut delta = output - activation; // Error at the output layer
-                deltas.push(delta.clone()); // Clone to store it for use in the next layer
-        
-                // Backpropagate through each layer
+
+                // Backward pass
+                let mut delta = activations.last().unwrap() - &output;
                 for i in (0..self.weights.len()).rev() {
-                    let delta = deltas.last().unwrap();
                     let z = &zs[i];
-                    let grad = delta * z.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 }); // Derivative of ReLU
-                    deltas.push(grad.clone()); // Clone to store it for use in the previous layer
-    
-                    let prev_activation = if i == 0 { input.clone() } else { activations[i - 1].clone() };
-                    let weight_gradient = grad.clone().insert_axis(Axis(1)).dot(&prev_activation.insert_axis(Axis(0)));
-                    self.weights[i] = &self.weights[i] - learning_rate * weight_gradient;
-                    self.biases[i] = &self.biases[i] - learning_rate * grad.sum_axis(Axis(0));
+                    if i != self.weights.len() - 1 {
+                        delta = delta * Self::relu_derivative(&z);
+                    }
+
+                    let prev_activation = &activations[i];
+                    let weight_grad = delta.view().insert_axis(Axis(1))
+                        .dot(&prev_activation.view().insert_axis(Axis(0)));
+
+                    self.weights[i] = self.weights[i].clone() - (learning_rate * weight_grad);
+                    self.biases[i] = self.biases[i].clone() - (learning_rate * delta.clone());
                 }
             }
-    
-            // After each epoch, check the error
-            let error = self.evaluate(&inputs, &outputs);
-            println!("Epoch: {}, Error: {} - Neurons: {:?}", epoch, error,self.neuron_counts[1]);
-    
-            // Stop adding neurons if the error is below the threshold
-            if error < error_threshold {
-                println!("Stopping early, error threshold met: {}", error_threshold);
+
+            let error = self.evaluate(inputs, outputs);
+            if error <= error_threshold {
+                println!("Training succeeded for {} gate, error threshold met.", logic_gate_name);
                 break;
             }
 
-            // Optionally add a new neuron only if the error is still above threshold
-            if error > error_threshold && epoch % 5000 == 0 {
-                let last_hidden_layer_index = self.neuron_counts.len() - 3; // Skip input and output layers
-                self.add_neuron_to_layer(last_hidden_layer_index);
-                //println!("Added a new neuron. New network architecture: {:?}", self.neuron_counts);
+            if error > 1.0 {
+                self.problem = true;
+                continue;
             }
 
-            // Decay the learning rate by a factor (e.g., 1.01 for slow decay)
-            learning_rate /= 1.05;
+            // Add neuron dynamically if still not below threshold
+            if error > error_threshold {
+                let last_hidden_layer = self.neuron_counts.len() - 3;
+                self.add_neuron_to_layer(last_hidden_layer);
+            }
+
+            learning_rate /= 1.05; // learning rate decay
         }
     }
 
     fn add_neuron_to_layer(&mut self, layer_index: usize) {
-        assert!(layer_index < self.weights.len() - 1, "Cannot add neuron to output layer");
+        assert!(
+            layer_index < self.weights.len() - 1,
+            "Cannot add neurons to output layer."
+        );
 
-        // Update bias vector: add one more bias
-        let new_bias = Array1::<f64>::zeros(1);  // A new bias value (initialized to zero)
-        self.biases[layer_index] = concatenate![Axis(0), self.biases[layer_index].clone(), new_bias];
+        let new_bias = Array1::<f64>::zeros(1);
+        self.biases[layer_index] =
+            concatenate![Axis(0), self.biases[layer_index].clone(), new_bias];
 
-        // Update weight matrix for the layer receiving input (add a row to increase output neurons)
         let input_size = self.weights[layer_index].dim().1;
         let new_weights = Array1::random(input_size, Uniform::new(-0.5, 0.5));
-        self.weights[layer_index].push_row(new_weights.view()).unwrap();
+        self.weights[layer_index]
+            .push_row(new_weights.view())
+            .unwrap();
 
-        // Update the *next* weight matrix: add a column for the new neuron
         let output_size = self.weights[layer_index + 1].dim().0;
         let new_out_weights = Array1::random(output_size, Uniform::new(-0.5, 0.5));
-        self.weights[layer_index + 1].push_column(new_out_weights.view()).unwrap();
+        self.weights[layer_index + 1]
+            .push_column(new_out_weights.view())
+            .unwrap();
 
-        // Update neuron count
         self.neuron_counts[layer_index + 1] += 1;
     }
 
     fn evaluate(&self, inputs: &Array2<f64>, outputs: &Array2<f64>) -> f64 {
-        let predicted_outputs: Vec<Array1<f64>> = inputs.axis_iter(Axis(0))  // Iterate over rows
-            .map(|input| self.forward(&input.to_owned())) // Clone the view to an owned array
-            .collect();
+        inputs
+            .outer_iter()
+            .zip(outputs.outer_iter())
+            .map(|(input, output)| {
+                let prediction = self.forward(&input.to_owned());
+                (&prediction - &output).mapv(|x| x.powi(2)).sum()
+            })
+            .sum::<f64>()
+            / (inputs.nrows() as f64 * outputs.ncols() as f64)
+    }
 
-        let error: f64 = predicted_outputs.iter().zip(outputs.rows()).map(|(predicted, actual)| {
-            let diff = predicted.clone() - actual;  // Element-wise difference
-            diff.mapv(|x| x.powi(2)).sum()  // Squared error for each example
-        }).sum::<f64>() / (predicted_outputs.len() as f64 * predicted_outputs[0].len() as f64);
+    // Save the neural network to a file
+    fn save_to_file(&self, filename: &str) -> io::Result<()> {
+        let file = File::create(filename)?;
+        serde_json::to_writer(file, &self)?;
+        Ok(())
+    }
 
-        error
+    // Load a neural network from a file
+    fn load_from_file(filename: &str) -> io::Result<NeuralNetwork> {
+        let file = File::open(filename)?;
+        let nn: NeuralNetwork = serde_json::from_reader(file)?;
+        Ok(nn)
     }
 }
 
 fn main() {
-    // Example data (XOR problem, should add neurons dynamically for more complex tasks)
-    let inputs = array![
-        [0.0, 0.0],
-        [0.0, 1.0],
-        [1.0, 0.0],
-        [1.0, 1.0],
+    let inputs = array![[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+
+    let logic_gates = vec![
+        (array![[0.0], [0.0], [0.0], [1.0]], "AND"),
+        (array![[0.0], [1.0], [1.0], [1.0]], "OR"),
+        (array![[1.0], [1.0], [1.0], [0.0]], "NAND"),
+        (array![[1.0], [0.0], [0.0], [0.0]], "NOR"),
+        (array![[0.0], [1.0], [1.0], [0.0]], "XOR"),
+        (array![[1.0], [0.0], [0.0], [1.0]], "XNOR"),
     ];
 
-    let outputs = array![
-        [0.0],
-        [1.0],
-        [1.0],
-        [0.0],
-    ];
+    let mut nn = NeuralNetwork::new(vec![2, 4, 1]);
 
-    let mut nn = NeuralNetwork::new(vec![2, 4, 1]); // Start with a simple 2-4-1 network
-
-    let max_epochs = 1000000;
+    let max_epochs = 10_000;
     let error_threshold = 0.01;
-    let initial_learning_rate = 0.001;  // Start with a smaller learning rate
+    let learning_rate = 0.001;
+    let mut filename = <String>::new();
+    let final_filename ="nn_saved.json".to_string();
 
-    nn.train(&inputs, &outputs, max_epochs, initial_learning_rate, error_threshold);  // Train for 10000 epochs
+    for (outputs, gate_name) in logic_gates {
+        let oldgate_filename = filename.clone();
+        let mut path = Path::new(&final_filename);
+        if path.exists(){
+            match NeuralNetwork::load_from_file(&final_filename) {
+                Ok(nn) => {
+                    println!("Successfully loaded the network.");
+                    
+                    let final_error = nn.evaluate(&inputs, &outputs);
+                    println!("Final error after learning {} gate: {:.6}", gate_name, final_error);                    
+
+                }
+                Err(e) => {
+                        eprintln!("Failed to load network: {}", e);
+                }
+            }
+        } else {
+            println!("Training network to learn {} gate:", gate_name);
+            while !nn.problem {
+                nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, gate_name);
+                if !nn.problem {
+                    break;
+                }
+                println!("Retrying training with simpler configuration for {} gate...", gate_name);
+                path = Path::new(&oldgate_filename);
+                if path.exists(){
+                    match NeuralNetwork::load_from_file(&oldgate_filename) {
+                        Ok(nn_progress) => {
+                            //println!("Successfully loaded the network's last step.");
+                            nn = nn_progress;
+                            nn.problem = false; //reinit.
+                            continue                  
+                        }
+                        Err(e) => {
+                                eprintln!("Failed to load network: {}", e);
+                        }
+                    }
+                } else {
+                    nn = NeuralNetwork::new(vec![2, 4, 1]); // Retry
+                }
+            }
+
+            // Save the neural network after training
+            filename = format!("nn_{}.json", gate_name);
+
+            if let Err(e) = nn.save_to_file(&filename) {
+                eprintln!("Failed to save network: {}", e);
+            } else {
+                println!("Network saved to: {}", filename);
+            }
 
 
-    // Final evaluation
-    let error = nn.evaluate(&inputs, &outputs);
-    println!("Final error: {}", error);
-    println!("Final number of neurons necessary: {:?}", nn.neuron_counts[1])
+        }
+       
+    }
+
+    
+
+    // final save of the neural network progress...
+    let filename_final = format!("nn_saved.json");
+
+    if let Err(e) = nn.save_to_file(&filename_final) {
+        eprintln!("Failed to save network: {}", e);
+    } else {
+        println!("Network saved to: {}", filename_final);
+    }
 }
