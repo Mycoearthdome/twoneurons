@@ -203,7 +203,7 @@ fn main() {
 
     let mut nn = NeuralNetwork::new(vec![2, 4, 1]);
 
-    let max_epochs = 10_000;
+    let max_epochs = 1000;
     let error_threshold = 0.01;
     let learning_rate = 0.001;
     let mut filename = <String>::new();
@@ -216,10 +216,11 @@ fn main() {
             match NeuralNetwork::load_from_file(&final_filename) {
                 Ok(nn) => {
                     println!("Successfully loaded the network.");
-                    
-                    let final_error = nn.evaluate(&inputs, &outputs);
-                    println!("Final error after learning {} gate: {:.6}", gate_name, final_error);                    
-
+                    let mut final_error = nn.evaluate(&inputs, &outputs);
+                    while final_error > error_threshold {
+                        final_error = nn.evaluate(&inputs, &outputs);
+                    }
+                    println!("Final error after learning {} gate: {:.6}", gate_name, final_error);            
                 }
                 Err(e) => {
                         eprintln!("Failed to load network: {}", e);
@@ -266,13 +267,15 @@ fn main() {
     }
 
     
-
     // final save of the neural network progress...
     let filename_final = format!("nn_saved.json");
 
-    if let Err(e) = nn.save_to_file(&filename_final) {
-        eprintln!("Failed to save network: {}", e);
-    } else {
-        println!("Network saved to: {}", filename_final);
+    let path = Path::new(&filename_final);
+    if !path.exists(){
+        if let Err(e) = nn.save_to_file(&filename_final) {
+            eprintln!("Failed to save network: {}", e);
+        } else {
+            println!("Network saved to: {}", filename_final);
+        }
     }
 }
