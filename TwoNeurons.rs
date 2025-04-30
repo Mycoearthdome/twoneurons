@@ -250,6 +250,7 @@ fn main() {
                 match NeuralNetwork::load_from_file(&final_filename) {
                     Ok(mut nn) => {
                         println!("Successfully loaded the network.");
+                        nn.problem = false; //reinit
                         let final_error = nn.evaluate(&inputs, &outputs);
                         //while final_error > error_threshold {
                         println!("Final error after learning {} gate: {:.6}", gate_name, final_error);
@@ -261,40 +262,20 @@ fn main() {
                                     break;
                                 }
                                 println!("Training for {} gate ... in progress!--> Neurons={:?}", gate_name, nn.neuron_counts[1]);
-                                path = Path::new(&oldgate_filename);
-                                if path.exists(){
-                                    match NeuralNetwork::load_from_file(&oldgate_filename) {
-                                        Ok(nn_progress) => {
-                                            //println!("Successfully loaded the network's last step.");
-                                            nn = nn_progress;
-                                            nn.problem = false; //reinit.
-                                            continue                  
-                                        }
-                                        Err(e) => {
-                                                eprintln!("Failed to load network: {}", e);
-                                        }
-                                    }
-                                } else {
-                                    nn = NeuralNetwork::new(vec![2, 4, 1]); // Retry
-                                }
                             }
 
-                            // Save the neural network after training
-                            filename = format!("nn_{}.json", gate_name);
-
-                            if let Err(e) = nn.save_to_file(&filename) {
+                            // Save the neural network's progress after re-training
+                            if let Err(e) = nn.save_to_file(&final_filename) {
                                 eprintln!("Failed to save network: {}", e);
-                            } else {
-                                println!("Network saved to: {}", filename);
                             }
-                            successfull = false;
-                    }
 
-                                    
+                            successfull = false;
+                        }
                     }
                     Err(e) => {
                             eprintln!("Failed to load network: {}", e);
                     }
+                    
                 }
             } else {
                 println!("Training network to learn {} gate:", gate_name);
