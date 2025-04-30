@@ -78,6 +78,7 @@ impl NeuralNetwork {
         logic_gate_name: &str,
     ) {
         self.problem = false;
+        let mut success_count = 0;
         for _epoch in 0..epochs {
             for (input, output) in inputs.outer_iter().zip(outputs.outer_iter()) {
                 let input = input.to_owned();
@@ -118,8 +119,15 @@ impl NeuralNetwork {
 
             let error = self.evaluate(inputs, outputs);
             if error <= error_threshold {
-                println!("Training succeeded for {} gate, error threshold met.", logic_gate_name);
-                break;
+                success_count += 1;
+                println!("Training succeeded for {} gate, error threshold met. IN PROGRESS {}!", logic_gate_name, success_count);
+                //break; //won't cut it for neural network if just one occurence.
+                if success_count >= epochs - 1000 {
+                    self.problem = false;
+                    break
+                } else {
+                    continue
+                }
             }
 
             if error > 1.0 {
@@ -128,7 +136,7 @@ impl NeuralNetwork {
             }
 
             // Add neuron dynamically if still not below threshold
-            if error > error_threshold {
+            if error > error_threshold { //stop adding neurons once you are on track.
                 let last_hidden_layer = self.neuron_counts.len() - 3;
                 self.add_neuron_to_layer(last_hidden_layer);
             }
@@ -195,17 +203,17 @@ fn main() {
     let logic_gates = vec![
         (array![[0.0], [0.0], [0.0], [1.0]], "AND"),
         (array![[0.0], [1.0], [1.0], [1.0]], "OR"),
-        (array![[1.0], [1.0], [1.0], [0.0]], "NAND"),
-        (array![[1.0], [0.0], [0.0], [0.0]], "NOR"),
         (array![[0.0], [1.0], [1.0], [0.0]], "XOR"),
         (array![[1.0], [0.0], [0.0], [1.0]], "XNOR"),
+        (array![[1.0], [0.0], [0.0], [0.0]], "NOR"),
+        (array![[1.0], [1.0], [1.0], [0.0]], "NAND"),
     ];
 
     let mut nn = NeuralNetwork::new(vec![2, 4, 1]);
 
-    let max_epochs = 1000;
+    let max_epochs = 10000;
     let error_threshold = 0.01;
-    let learning_rate = 0.001;
+    let learning_rate = 0.1; //experiment with lowering it down if it fails.
     let mut filename = <String>::new();
     let final_filename ="nn_saved.json".to_string();
 
@@ -216,11 +224,12 @@ fn main() {
             match NeuralNetwork::load_from_file(&final_filename) {
                 Ok(nn) => {
                     println!("Successfully loaded the network.");
-                    let mut final_error = nn.evaluate(&inputs, &outputs);
-                    while final_error > error_threshold {
-                        final_error = nn.evaluate(&inputs, &outputs);
-                    }
-                    println!("Final error after learning {} gate: {:.6}", gate_name, final_error);            
+                    let final_error = nn.evaluate(&inputs, &outputs);
+                    //while final_error > error_threshold {
+                    println!("Final error after learning {} gate: {:.6}", gate_name, final_error);
+                    //    final_error = nn.evaluate(&inputs, &outputs);
+                    //}
+                                
                 }
                 Err(e) => {
                         eprintln!("Failed to load network: {}", e);
