@@ -8,6 +8,8 @@ use serde::{Serialize, Deserialize};
 use std::fs::File;
 use std::io::{self, Write, Read};
 use std::path::Path;
+use ndarray_rand::rand_distr::{Normal, Distribution};
+use std::process::exit;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct NeuralNetwork {
@@ -23,7 +25,7 @@ impl NeuralNetwork {
         let mut weights = Vec::new();
         let mut biases = Vec::new();
 
-        for i in 0..neuron_counts.len() - 1 {
+        /*for i in 0..neuron_counts.len() - 1 {
             let weight = Array2::<f64>::random_using(
                 (neuron_counts[i + 1], neuron_counts[i]),
                 Uniform::new(-0.5, 0.5),
@@ -34,6 +36,25 @@ impl NeuralNetwork {
                 Uniform::new(-0.1, 0.1),
                 &mut rng,
             );
+            weights.push(weight);
+            biases.push(bias);
+        }*/
+
+        for i in 0..neuron_counts.len() - 1 {
+            let std_dev = (2.0 / neuron_counts[i] as f64).sqrt();
+            let normal = match Normal::new(0.0, std_dev) {
+                Ok(dist) => dist,
+                Err(err) => {
+                    eprintln!("Error creating normal distribution: {}", err);
+                    exit(1);
+                }
+            };
+            let weight = Array2::<f64>::random_using(
+                (neuron_counts[i + 1], neuron_counts[i]),
+                normal,
+                &mut rng,
+            );
+            let bias = Array1::<f64>::zeros(neuron_counts[i + 1]);
             weights.push(weight);
             biases.push(bias);
         }
@@ -120,14 +141,16 @@ impl NeuralNetwork {
             let error = self.evaluate(inputs, outputs);
             if error <= error_threshold {
                 success_count += 1;
-                println!("Training succeeded for {} gate, error threshold met. IN PROGRESS {}!", logic_gate_name, success_count);
+                println!("Training succeeded for {} gate, error threshold met.! --> Neurons={}", logic_gate_name, self.neuron_counts[1]);
                 //break; //won't cut it for neural network if just one occurence.
-                if success_count >= epochs - 1000 {
-                    self.problem = false;
-                    break
-                } else {
-                    continue
-                }
+                //if success_count >= epochs - 1000 {
+                //    self.problem = false;
+                //    break
+                //} else {
+                //    continue
+                //}
+                self.problem = false;
+                break
             }
 
             if error > 1.0 {
@@ -141,7 +164,7 @@ impl NeuralNetwork {
                 self.add_neuron_to_layer(last_hidden_layer);
             }
 
-            learning_rate /= 1.05; // learning rate decay
+            learning_rate /= 1.03; // learning rate decay (from 1.05)
         }
     }
 
@@ -205,74 +228,114 @@ fn main() {
         (array![[0.0], [1.0], [1.0], [1.0]], "OR"),
         (array![[0.0], [1.0], [1.0], [0.0]], "XOR"),
         (array![[1.0], [0.0], [0.0], [1.0]], "XNOR"),
-        (array![[1.0], [0.0], [0.0], [0.0]], "NOR"),
         (array![[1.0], [1.0], [1.0], [0.0]], "NAND"),
+        (array![[1.0], [0.0], [0.0], [0.0]], "NOR"),
     ];
 
     let mut nn = NeuralNetwork::new(vec![2, 4, 1]);
 
-    let max_epochs = 10000;
-    let error_threshold = 0.01;
-    let learning_rate = 0.1; //experiment with lowering it down if it fails.
+    let max_epochs = 10_000;
+    let error_threshold = 0.001;
+    let learning_rate = 0.5; //experiment with lowering it down if it fails.
     let mut filename = <String>::new();
     let final_filename ="nn_saved.json".to_string();
 
-    for (outputs, gate_name) in logic_gates {
-        let oldgate_filename = filename.clone();
-        let mut path = Path::new(&final_filename);
-        if path.exists(){
-            match NeuralNetwork::load_from_file(&final_filename) {
-                Ok(nn) => {
-                    println!("Successfully loaded the network.");
-                    let final_error = nn.evaluate(&inputs, &outputs);
-                    //while final_error > error_threshold {
-                    println!("Final error after learning {} gate: {:.6}", gate_name, final_error);
-                    //    final_error = nn.evaluate(&inputs, &outputs);
-                    //}
-                                
-                }
-                Err(e) => {
-                        eprintln!("Failed to load network: {}", e);
-                }
-            }
-        } else {
-            println!("Training network to learn {} gate:", gate_name);
-            while !nn.problem {
-                nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, gate_name);
-                if !nn.problem {
-                    break;
-                }
-                println!("Retrying training with simpler configuration for {} gate...", gate_name);
-                path = Path::new(&oldgate_filename);
-                if path.exists(){
-                    match NeuralNetwork::load_from_file(&oldgate_filename) {
-                        Ok(nn_progress) => {
-                            //println!("Successfully loaded the network's last step.");
-                            nn = nn_progress;
-                            nn.problem = false; //reinit.
-                            continue                  
-                        }
-                        Err(e) => {
-                                eprintln!("Failed to load network: {}", e);
-                        }
+    let mut successfull:bool = false;
+    while !successfull{
+        successfull = true;
+        for (outputs, gate_name) in logic_gates.clone() {
+            let oldgate_filename = filename.clone();
+            let mut path = Path::new(&final_filename);
+            if path.exists(){
+                match NeuralNetwork::load_from_file(&final_filename) {
+                    Ok(mut nn) => {
+                        println!("Successfully loaded the network.");
+                        let final_error = nn.evaluate(&inputs, &outputs);
+                        //while final_error > error_threshold {
+                        println!("Final error after learning {} gate: {:.6}", gate_name, final_error);
+                        if final_error > error_threshold {
+                            println!("Re-Training network to learn {} gate:", gate_name);
+                            while !nn.problem {
+                                nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, gate_name);
+                                if !nn.problem {
+                                    break;
+                                }
+                                println!("Training for {} gate ... in progress!--> Neurons={:?}", gate_name, nn.neuron_counts[1]);
+                                path = Path::new(&oldgate_filename);
+                                if path.exists(){
+                                    match NeuralNetwork::load_from_file(&oldgate_filename) {
+                                        Ok(nn_progress) => {
+                                            //println!("Successfully loaded the network's last step.");
+                                            nn = nn_progress;
+                                            nn.problem = false; //reinit.
+                                            continue                  
+                                        }
+                                        Err(e) => {
+                                                eprintln!("Failed to load network: {}", e);
+                                        }
+                                    }
+                                } else {
+                                    nn = NeuralNetwork::new(vec![2, 4, 1]); // Retry
+                                }
+                            }
+
+                            // Save the neural network after training
+                            filename = format!("nn_{}.json", gate_name);
+
+                            if let Err(e) = nn.save_to_file(&filename) {
+                                eprintln!("Failed to save network: {}", e);
+                            } else {
+                                println!("Network saved to: {}", filename);
+                            }
+                            successfull = false;
                     }
-                } else {
-                    nn = NeuralNetwork::new(vec![2, 4, 1]); // Retry
+
+                                    
+                    }
+                    Err(e) => {
+                            eprintln!("Failed to load network: {}", e);
+                    }
                 }
-            }
-
-            // Save the neural network after training
-            filename = format!("nn_{}.json", gate_name);
-
-            if let Err(e) = nn.save_to_file(&filename) {
-                eprintln!("Failed to save network: {}", e);
             } else {
-                println!("Network saved to: {}", filename);
+                println!("Training network to learn {} gate:", gate_name);
+                while !nn.problem {
+                    nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, gate_name);
+                    if !nn.problem {
+                        break;
+                    }
+                    println!("Training for {} gate ... in progress!--> Neurons={:?}", gate_name, nn.neuron_counts[1]);
+                    path = Path::new(&oldgate_filename);
+                    if path.exists(){
+                        match NeuralNetwork::load_from_file(&oldgate_filename) {
+                            Ok(nn_progress) => {
+                                //println!("Successfully loaded the network's last step.");
+                                nn = nn_progress;
+                                nn.problem = false; //reinit.
+                                continue                  
+                            }
+                            Err(e) => {
+                                    eprintln!("Failed to load network: {}", e);
+                            }
+                        }
+                    } else {
+                        nn = NeuralNetwork::new(vec![2, 4, 1]); // Retry
+                    }
+                }
+
+                // Save the neural network after training
+                filename = format!("nn_{}.json", gate_name);
+
+                if let Err(e) = nn.save_to_file(&filename) {
+                    eprintln!("Failed to save network: {}", e);
+                } else {
+                    println!("Network saved to: {}", filename);
+                }
+
+
             }
-
-
+        
         }
-       
+
     }
 
     
