@@ -244,7 +244,7 @@ fn main() {
                     Ok(mut nn) => {
                         //println!("Successfully loaded the network.");
                         nn.problem = false; //reinit
-                        //error_threshold = 0.01; // still acceptable for retraining (faster)
+                        error_threshold = 0.01; // still acceptable for retraining (faster)
                         let final_error = nn.evaluate(&inputs, &outputs);
                         logic_final_errors.insert(gate_name.to_string(), final_error);
                         println!("Final error after learning {} gate: {:.6}", gate_name, final_error);
