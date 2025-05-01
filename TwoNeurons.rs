@@ -10,6 +10,7 @@ use std::io::{self, Write, Read};
 use std::path::Path;
 use ndarray_rand::rand_distr::{Normal, Distribution};
 use std::process::exit;
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct NeuralNetwork {
@@ -99,7 +100,6 @@ impl NeuralNetwork {
         logic_gate_name: &str,
     ) {
         self.problem = false;
-        let mut success_count = 0;
         for _epoch in 0..epochs {
             for (input, output) in inputs.outer_iter().zip(outputs.outer_iter()) {
                 let input = input.to_owned();
@@ -140,15 +140,8 @@ impl NeuralNetwork {
 
             let error = self.evaluate(inputs, outputs);
             if error <= error_threshold {
-                success_count += 1;
-                println!("Training succeeded for {} gate, error threshold met.! --> Neurons={}", logic_gate_name, self.neuron_counts[1]);
-                //break; //won't cut it for neural network if just one occurence.
-                //if success_count >= epochs - 1000 {
-                //    self.problem = false;
-                //    break
-                //} else {
-                //    continue
-                //}
+                //println!("Training succeeded for {} gate, error threshold met.! --> Neurons={}", logic_gate_name, self.neuron_counts[1]);
+                //info: break after one occurence only!
                 self.problem = false;
                 break
             }
@@ -235,11 +228,11 @@ fn main() {
     let mut nn = NeuralNetwork::new(vec![2, 4, 1]);
 
     let max_epochs = 10_000;
-    let error_threshold = 0.001;
+    let mut error_threshold = 0.001; //default 0.001
     let learning_rate = 0.5; //experiment with lowering it down if it fails.
     let mut filename = <String>::new();
     let final_filename ="nn_saved.json".to_string();
-
+    let mut logic_final_errors: HashMap<String, f64> = HashMap::new();
     let mut successfull:bool = false;
     while !successfull{
         successfull = true;
@@ -249,16 +242,32 @@ fn main() {
             if path.exists(){
                 match NeuralNetwork::load_from_file(&final_filename) {
                     Ok(mut nn) => {
-                        println!("Successfully loaded the network.");
+                        //println!("Successfully loaded the network.");
                         nn.problem = false; //reinit
+                        //error_threshold = 0.01; // still acceptable for retraining (faster)
                         let final_error = nn.evaluate(&inputs, &outputs);
-                        //while final_error > error_threshold {
+                        logic_final_errors.insert(gate_name.to_string(), final_error);
                         println!("Final error after learning {} gate: {:.6}", gate_name, final_error);
                         if final_error > error_threshold {
-                            println!("Re-Training network to learn {} gate:", gate_name);
+                            //println!("Re-Training network to learn {} gate:", gate_name);
                             while !nn.problem {
+                                let mut check_them_all = 1;
                                 nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, gate_name);
                                 if !nn.problem {
+                                    //evaluate whether all the answers are within error_threshold.
+                                    for (_gate_name, final_error) in logic_final_errors.clone(){
+                                        if final_error <= error_threshold{
+                                            check_them_all += 1;
+                                        }
+                                    }
+                                    if check_them_all == logic_gates.len(){
+                                        //save and exit....
+                                        if let Err(e) = nn.save_to_file(&final_filename) {
+                                            eprintln!("Failed to save network: {}", e);
+                                        }
+                                        exit(0);
+
+                                    }
                                     break;
                                 }
                                 println!("Training for {} gate ... in progress!--> Neurons={:?}", gate_name, nn.neuron_counts[1]);
