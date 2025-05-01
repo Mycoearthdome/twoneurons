@@ -95,12 +95,14 @@ impl NeuralNetwork {
         inputs: &Array2<f64>,
         outputs: &Array2<f64>,
         epochs: usize,
-        mut learning_rate: f64,
+        learning_rate: f64,
         error_threshold: f64,
-        logic_gate_name: &str,
+        decay_rate: f64,
     ) {
         self.problem = false;
-        for _epoch in 0..epochs {
+        let initial_learning_rate = learning_rate;
+        let mut decayed_learning_rate:f64 = initial_learning_rate;
+        for epoch in 0..epochs {
             for (input, output) in inputs.outer_iter().zip(outputs.outer_iter()) {
                 let input = input.to_owned();
                 let output = output.to_owned();
@@ -133,8 +135,8 @@ impl NeuralNetwork {
                     let weight_grad = delta.view().insert_axis(Axis(1))
                         .dot(&prev_activation.view().insert_axis(Axis(0)));
 
-                    self.weights[i] = self.weights[i].clone() - (learning_rate * weight_grad);
-                    self.biases[i] = self.biases[i].clone() - (learning_rate * delta.clone());
+                    self.weights[i] = self.weights[i].clone() - (decayed_learning_rate * weight_grad);
+                    self.biases[i] = self.biases[i].clone() - (decayed_learning_rate * delta.clone());
                 }
             }
 
@@ -157,7 +159,8 @@ impl NeuralNetwork {
                 self.add_neuron_to_layer(last_hidden_layer);
             }
 
-            learning_rate /= 1.03; // learning rate decay (from 1.05)
+            //learning_rate /= 1.03; // learning rate decay (from 1.05)
+            decayed_learning_rate = exponential_decay(epoch, initial_learning_rate, decay_rate);
         }
     }
 
@@ -213,6 +216,10 @@ impl NeuralNetwork {
     }
 }
 
+fn exponential_decay(epoch: usize, initial_lr: f64, decay_rate: f64) -> f64 {
+    initial_lr * (decay_rate).powi(epoch as i32)
+}
+
 fn main() {
     let inputs = array![[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
 
@@ -230,6 +237,7 @@ fn main() {
     let max_epochs = 10_000;
     let mut error_threshold = 0.001; //default 0.001
     let learning_rate = 0.5; //experiment with lowering it down if it fails.
+    let decay_rate = 0.99; //usually between 0 and 1
     let mut filename = <String>::new();
     let final_filename ="nn_saved.json".to_string();
     let mut logic_final_errors: HashMap<String, f64> = HashMap::new();
@@ -252,7 +260,7 @@ fn main() {
                             //println!("Re-Training network to learn {} gate:", gate_name);
                             while !nn.problem {
                                 let mut check_them_all = 1;
-                                nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, gate_name);
+                                nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate);
                                 if !nn.problem {
                                     //evaluate whether all the answers are within error_threshold.
                                     for (_gate_name, final_error) in logic_final_errors.clone(){
@@ -289,7 +297,7 @@ fn main() {
             } else {
                 println!("Training network to learn {} gate:", gate_name);
                 while !nn.problem {
-                    nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, gate_name);
+                    nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate);
                     if !nn.problem {
                         break;
                     }
