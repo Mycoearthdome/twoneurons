@@ -1,6 +1,7 @@
 use ndarray::concatenate;
 use ndarray::prelude::*;
 use ndarray_rand::rand::rngs::StdRng;
+use ndarray_rand::rand::Rng;
 use ndarray_rand::rand::SeedableRng;
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
@@ -272,20 +273,21 @@ fn generate_realistic_drone_inputs(num_samples: usize) -> Array2<f64> {
     })
 }
 
-fn generate_realistic_outputs(inputs: &Array2<f64>) -> Array2<f64> {
+fn generate_outputs_to_fly_toward_laser(inputs: &Array2<f64>) -> Array2<f64> {
     let rows: Vec<Array1<f64>> = inputs.outer_iter().map(|input| {
-        let z = input[2];
-        let vz = input[8];
-        let vx = input[6];
-        let vy = input[7];
-        let ax = input[9];
-        let ay = input[10];
+        let dz = input[20];  // z delta
+        let dx = input[18];  // x delta
+        let dy = input[19];  // y delta
         let yaw = input[5];
         let omega_z = input[14];
 
-        let mut throttle = 0.5 + (-z + vz) * 0.01;
-        let mut pitch = 0.5 + (-vx + ax) * 0.01;
-        let mut roll = 0.5 + (-vy + ay) * 0.01;
+        let vz = input[8];
+        let vx = input[6];
+        let vy = input[7];
+
+        let mut throttle = 0.5 + (-dz + vz) * 0.01;
+        let mut pitch = 0.5 + (-dx + vx) * 0.01;
+        let mut roll = 0.5 + (-dy + vy) * 0.01;
         let mut yaw_rate = 0.5 + (-yaw + omega_z) * 0.005;
 
         for val in [&mut throttle, &mut pitch, &mut roll, &mut yaw_rate] {
@@ -298,7 +300,35 @@ fn generate_realistic_outputs(inputs: &Array2<f64>) -> Array2<f64> {
     stack(Axis(0), &rows.iter().map(|x| x.view()).collect::<Vec<_>>()).unwrap()
 }
 
+fn generate_drone_inputs_with_laser(num_samples: usize) -> Array2<f64> {
+    let mut rng = StdRng::from_entropy();
 
+    let base_inputs = generate_realistic_drone_inputs(num_samples);
+    let mut inputs_with_laser = Array2::<f64>::zeros((num_samples, 21));
+
+    for i in 0..num_samples {
+        let drone_x = base_inputs[[i, 0]];
+        let drone_y = base_inputs[[i, 1]];
+        let drone_z = base_inputs[[i, 2]];
+
+        // Simulated laser dot (random target point nearby)
+        let laser_x = drone_x + rng.gen_range(-50.0..50.0);
+        let laser_y = drone_y + rng.gen_range(-50.0..50.0);
+        let laser_z = drone_z + rng.gen_range(-30.0..30.0);
+
+        // Insert original telemetry
+        for j in 0..18 {
+            inputs_with_laser[[i, j]] = base_inputs[[i, j]];
+        }
+
+        // Insert relative laser position
+        inputs_with_laser[[i, 18]] = laser_x - drone_x;
+        inputs_with_laser[[i, 19]] = laser_y - drone_y;
+        inputs_with_laser[[i, 20]] = laser_z - drone_z;
+    }
+
+    inputs_with_laser
+}
 
 fn get_input_feature_ranges() -> Vec<(f64, f64)> {
     vec![
@@ -320,6 +350,9 @@ fn get_input_feature_ranges() -> Vec<(f64, f64)> {
         (0.0, 1.0),        // battery
         (0.0, 1.0),        // throttle hint
         (0.0, 1.0),        // pitch hint
+        (-100.0, 100.0),   // Δx to laser
+        (-100.0, 100.0),   // Δy to laser
+        (-100.0, 100.0),   // Δz to laser
     ]
 }
 
@@ -378,19 +411,15 @@ fn interpret_control(name: &str, value: f64) -> &'static str {
 }
 
 fn main() {
-    let num_samples = 1000;
-    let input_dim = 18;
-    let output_dim = 4; // Example: motor command outputs (throttle, yaw, pitch, roll)
+    let num_samples = 2000;
+    let input_dim = 21;
+    let output_dim = 4;
 
-    // Simulate realistic drone inputs
-    let raw_inputs = generate_realistic_drone_inputs(num_samples);
-    let inputs = normalize_inputs(&raw_inputs); // normalized to [0.0, 1.0]
+    let raw_inputs = generate_drone_inputs_with_laser(num_samples);
+    let inputs = normalize_inputs(&raw_inputs);
+    let outputs = generate_outputs_to_fly_toward_laser(&raw_inputs);
 
-    // Simulate ideal motor command outputs for learning
-    let outputs = generate_realistic_outputs(&inputs);
-
-
-    let mut nn = NeuralNetwork::new(vec![input_dim, 12, 8, output_dim]);
+    let mut nn = NeuralNetwork::new(vec![input_dim, 16, 12, output_dim]);
 
     let max_epochs = 10_000;
     let learning_rate = 0.001;
@@ -400,9 +429,9 @@ fn main() {
     let max_neurons = 64;
     let mut rmse_percentage = 100.0;
     let target_rmse = 5.0;
-    let final_filename = "realistic_drone_nn.json";
+    let final_filename = "realistic_drone_laser_nn.json";
 
-    println!("Training neural network with realistic drone flight data...please wait!");
+    println!("Training drone to follow IR laser trajectory...");
 
     while rmse_percentage > target_rmse{
             nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate, patience_limit, max_neurons);
