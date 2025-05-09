@@ -89,10 +89,23 @@ impl NeuralNetwork {
         activation
     }
 
-    fn train(&mut self, inputs: &Array2<f64>, outputs: &Array2<f64>, epochs: usize, learning_rate: f64, error_threshold: f64, decay_rate: f64) {
+    fn train(
+        &mut self,
+        inputs: &Array2<f64>,
+        outputs: &Array2<f64>,
+        epochs: usize,
+        learning_rate: f64,
+        error_threshold: f64,
+        decay_rate: f64,
+        patience_limit: usize, 
+        max_neurons: usize
+    ) {
         self.problem = false;
         let initial_learning_rate = learning_rate;
         let mut decayed_learning_rate = initial_learning_rate;
+
+        let mut best_val_error = f64::MAX;
+        let mut patience_counter = 0;
     
         for epoch in 0..epochs {
             // Accumulate gradients in parallel
@@ -158,30 +171,39 @@ impl NeuralNetwork {
             }
     
             let error = self.evaluate(inputs, outputs);
-            if error <= error_threshold {
-                self.problem = false;
-                break;
-            }
-    
-            if error > 1.0 {
-                self.problem = true;
-                continue;
+            let total_loss = error + self.l2_penalty(0.0001); // λ = 0.0001 is a good start
+
+            if error < best_val_error {
+                best_val_error = error;
+                patience_counter = 0;
+            } else {
+                patience_counter += 1;
+                if patience_counter >= patience_limit {
+                    println!("Early stopping at epoch {} — no improvement in validation error.", epoch);
+                    self.problem = true;
+                    break;
+                }
             }
     
             if error > error_threshold {
                 let last_hidden_layer = self.neuron_counts.len() - 3;
-                self.add_neuron_to_layer(last_hidden_layer);
+                self.add_neuron_to_layer(last_hidden_layer, max_neurons);
             }
     
             decayed_learning_rate = exponential_decay(epoch, initial_learning_rate, decay_rate);
         }
     }
 
-    fn add_neuron_to_layer(&mut self, layer_index: usize) {
+    fn add_neuron_to_layer(&mut self, layer_index: usize, max_neurons: usize) {
         assert!(
             layer_index < self.weights.len() - 1,
             "Cannot add neurons to output layer."
         );
+
+        if self.neuron_counts[layer_index + 1] >= max_neurons {
+            //println!("Max neurons reached for layer {}; skipping addition.", layer_index);
+            return;
+        }
 
         let new_bias = Array1::<f64>::zeros(1);
         self.biases[layer_index] =
@@ -232,6 +254,12 @@ impl NeuralNetwork {
         let clipped = x.mapv(|v| v.max(-10.0).min(10.0));
         let s = Self::sigmoid(&clipped);
         &s * &(1.0 - &s)
+    }
+
+    fn l2_penalty(&self, lambda: f64) -> f64 {
+        self.weights.iter()
+            .map(|w| w.mapv(|v| v.powi(2)).sum())
+            .sum::<f64>() * lambda
     }
     
 }
@@ -384,49 +412,54 @@ fn main() {
     let mut nn = NeuralNetwork::new(vec![input_dim, 12, 8, output_dim]);
 
     let max_epochs = 10_000;
-    let learning_rate = 0.01;
-    let error_threshold = 0.001;
-    let decay_rate = 0.99;
+    let learning_rate = 0.001;
+    let error_threshold = 0.01;
+    let decay_rate = 0.995;
+    let patience_limit = 200;
+    let max_neurons = 64;
     let final_filename = "realistic_drone_nn.json";
 
     println!("Training neural network with realistic drone flight data...");
-    nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate);
+    nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate, patience_limit, max_neurons);
 
     let final_error = nn.evaluate(&inputs, &outputs);
+
     // Convert final error to RMSE (Root Mean Squared Error)
     let rmse = final_error.sqrt();
-    
+        
     // Convert RMSE to percentage (assuming outputs are normalized between 0 and 1)
     let rmse_percentage = rmse * 100.0;
 
     println!("Final training error (RMSE in percentage): {:.2}%", rmse_percentage);
 
-    if let Err(e) = nn.save_to_file(final_filename) {
-        eprintln!("Failed to save network: {}", e);
-    } else {
-        println!("Network saved to: {}", final_filename);
-    }
+    if nn.problem && rmse_percentage < 10.0{ // 5-10% means training probably succedded.
+        if let Err(e) = nn.save_to_file(final_filename) {
+            eprintln!("Failed to save network: {}", e);
+        } else {
+            println!("Network saved to: {}", final_filename);
+        }
 
-    // example Prediction
-    let sample_input = inputs.row(0).to_owned();
-    let result = nn.forward(&sample_input);
-    println!("\n--- Sample Prediction ---");
-    //println!("Sample normalized input (telemetry): {:?}", sample_input);
-    println!("Predicted control output (normalized values in [0.0 - 1.0]):");
-    println!("  Throttle : {:.4} → {}",
-        result[0],
-        interpret_control("throttle", result[0])
-    );
-    println!("  Pitch    : {:.4} → {}",
-        result[1],
-        interpret_control("pitch", result[1])
-    );
-    println!("  Roll     : {:.4} → {}",
-        result[2],
-        interpret_control("roll", result[2])
-    );
-    println!("  Yaw Rate : {:.4} → {}",
-        result[3],
-        interpret_control("yaw", result[3])
-    );
+        // example Prediction
+        let sample_input = inputs.row(0).to_owned();
+        let result = nn.forward(&sample_input);
+        println!("\n--- Sample Prediction ---");
+        //println!("Sample normalized input (telemetry): {:?}", sample_input);
+        println!("Predicted control output (normalized values in [0.0 - 1.0]):");
+        println!("  Throttle : {:.4} → {}",
+            result[0],
+            interpret_control("throttle", result[0])
+        );
+        println!("  Pitch    : {:.4} → {}",
+            result[1],
+            interpret_control("pitch", result[1])
+        );
+        println!("  Roll     : {:.4} → {}",
+            result[2],
+            interpret_control("roll", result[2])
+        );
+        println!("  Yaw Rate : {:.4} → {}",
+            result[3],
+            interpret_control("yaw", result[3])
+        );
+    }
 }
