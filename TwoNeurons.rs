@@ -11,6 +11,7 @@ use std::path::Path;
 use ndarray_rand::rand_distr::{Normal, Distribution};
 use std::process::exit;
 use std::collections::HashMap;
+use rayon::prelude::*;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct NeuralNetwork {
@@ -78,88 +79,101 @@ impl NeuralNetwork {
 
     fn forward(&self, input: &Array1<f64>) -> Array1<f64> {
         let mut activation = input.clone();
-        for (i, (weight, bias)) in self.weights.iter().zip(&self.biases).enumerate() {
+        self.weights.iter().zip(&self.biases).enumerate().for_each(|(i, (weight, bias))| {
             let z = weight.dot(&activation) + bias;
-            if i == self.weights.len() - 1 {
-                // Output layer (no softmax, using MSE loss)
-                activation = z;
+            activation = if i == self.weights.len() - 1 {
+                Self::sigmoid(&z)
             } else {
-                activation = Self::relu(&z);
-            }
-        }
+                Self::relu(&z)
+            };
+        });
         activation
     }
 
-    fn train(
-        &mut self,
-        inputs: &Array2<f64>,
-        outputs: &Array2<f64>,
-        epochs: usize,
-        learning_rate: f64,
-        error_threshold: f64,
-        decay_rate: f64,
-    ) {
+    fn train(&mut self, inputs: &Array2<f64>, outputs: &Array2<f64>, epochs: usize, learning_rate: f64, error_threshold: f64, decay_rate: f64) {
         self.problem = false;
         let initial_learning_rate = learning_rate;
-        let mut decayed_learning_rate:f64 = initial_learning_rate;
+        let mut decayed_learning_rate = initial_learning_rate;
+    
         for epoch in 0..epochs {
-            for (input, output) in inputs.outer_iter().zip(outputs.outer_iter()) {
-                let input = input.to_owned();
-                let output = output.to_owned();
-
-                let mut activations = vec![input.clone()];
-                let mut zs = Vec::new();
-
-                // Forward pass
-                let mut activation = input.clone();
-                for (i, (weight, bias)) in self.weights.iter().zip(&self.biases).enumerate() {
-                    let z = weight.dot(&activation) + bias;
-                    zs.push(z.clone());
-                    activation = if i == self.weights.len() - 1 {
-                        z
-                    } else {
-                        Self::relu(&z)
-                    };
-                    activations.push(activation.clone());
-                }
-
-                // Backward pass
-                let mut delta = activations.last().unwrap() - &output;
-                for i in (0..self.weights.len()).rev() {
-                    let z = &zs[i];
-                    if i != self.weights.len() - 1 {
-                        delta = delta * Self::relu_derivative(&z);
+            // Accumulate gradients in parallel
+            let gradients: Vec<_> = inputs.outer_iter()
+                .zip(outputs.outer_iter())
+                .par_bridge()
+                .map(|(input, output)| {
+                    let input = input.to_owned();
+                    let output = output.to_owned();
+                    let mut activations = vec![input.clone()];
+                    let mut zs = Vec::new();
+    
+                    // Forward pass
+                    let mut activation = input;
+                    for (i, (weight, bias)) in self.weights.iter().zip(&self.biases).enumerate() {
+                        let z = weight.dot(&activation) + bias;
+                        zs.push(z.clone());
+                        activation = if i == self.weights.len() - 1 {
+                            Self::sigmoid(&z)
+                        } else {
+                            Self::relu(&z)
+                        };
+                        activations.push(activation.clone());
                     }
-
-                    let prev_activation = &activations[i];
-                    let weight_grad = delta.view().insert_axis(Axis(1))
-                        .dot(&prev_activation.view().insert_axis(Axis(0)));
-
-                    self.weights[i] = self.weights[i].clone() - (decayed_learning_rate * weight_grad);
-                    self.biases[i] = self.biases[i].clone() - (decayed_learning_rate * delta.clone());
+    
+                    // Backward pass
+                    let mut nabla_w: Vec<Array2<f64>> = self.weights.iter().map(|w| Array2::zeros(w.raw_dim())).collect();
+                    let mut nabla_b: Vec<Array1<f64>> = self.biases.iter().map(|b| Array1::zeros(b.raw_dim())).collect();
+    
+                    let z_last = &zs[zs.len() - 1];
+                    let a_last = activations.last().unwrap();
+                    let sigmoid_prime = Self::sigmoid_derivative(z_last);
+                    let mut delta = (a_last - &output) * sigmoid_prime;
+    
+                    for i in (0..self.weights.len()).rev() {
+                        if i != self.weights.len() - 1 {
+                            delta = delta * Self::relu_derivative(&zs[i]);
+                        }
+    
+                        let prev_activation = &activations[i];
+                        nabla_w[i] = delta.view().insert_axis(Axis(1))
+                            .dot(&prev_activation.view().insert_axis(Axis(0)));
+                        nabla_b[i] = delta.clone();
+                        delta = self.weights[i].t().dot(&delta);
+                    }
+    
+                    (nabla_w, nabla_b)
+                }).collect();
+    
+            // Aggregate and apply gradients
+            for i in 0..self.weights.len() {
+                let mut total_w = Array2::zeros(self.weights[i].dim());
+                let mut total_b = Array1::zeros(self.biases[i].dim());
+    
+                for (grad_w, grad_b) in &gradients {
+                    total_w = total_w.clone() + &grad_w[i];
+                    total_b = total_b.clone() + &grad_b[i];
                 }
+    
+                let batch_size = gradients.len() as f64;
+                self.weights[i] = self.weights[i].clone() - (decayed_learning_rate / batch_size) * total_w;
+                self.biases[i] = self.biases[i].clone() - (decayed_learning_rate / batch_size) * total_b;
             }
-
+    
             let error = self.evaluate(inputs, outputs);
             if error <= error_threshold {
-                //println!("Training succeeded for {} gate, error threshold met.! --> Neurons={}", logic_gate_name, self.neuron_counts[1]);
-                //info: break after one occurence only!
                 self.problem = false;
-                break
+                break;
             }
-
+    
             if error > 1.0 {
                 self.problem = true;
                 continue;
             }
-
-            // Add neuron dynamically if still not below threshold
-            if error > error_threshold { //stop adding neurons once you are on track.
+    
+            if error > error_threshold {
                 let last_hidden_layer = self.neuron_counts.len() - 3;
                 self.add_neuron_to_layer(last_hidden_layer);
             }
-
-            //learning_rate /= 1.03; // learning rate decay (from 1.05)
+    
             decayed_learning_rate = exponential_decay(epoch, initial_learning_rate, decay_rate);
         }
     }
@@ -190,16 +204,12 @@ impl NeuralNetwork {
     }
 
     fn evaluate(&self, inputs: &Array2<f64>, outputs: &Array2<f64>) -> f64 {
-        inputs
-            .outer_iter()
-            .zip(outputs.outer_iter())
-            .map(|(input, output)| {
-                let prediction = self.forward(&input.to_owned());
-                (&prediction - &output).mapv(|x| x.powi(2)).sum()
-            })
-            .sum::<f64>()
-            / (inputs.nrows() as f64 * outputs.ncols() as f64)
+        inputs.outer_iter().zip(outputs.outer_iter()).par_bridge().map(|(input, output)| {
+            let prediction = self.forward(&input.to_owned());
+            (&prediction - &output).mapv(|x| x.powi(2)).sum()
+        }).sum::<f64>() / (inputs.nrows() as f64 * outputs.ncols() as f64)
     }
+    
 
     // Save the neural network to a file
     fn save_to_file(&self, filename: &str) -> io::Result<()> {
@@ -214,6 +224,17 @@ impl NeuralNetwork {
         let nn: NeuralNetwork = serde_json::from_reader(file)?;
         Ok(nn)
     }
+
+    fn sigmoid(x: &Array1<f64>) -> Array1<f64> {
+        x.mapv(|v| 1.0 / (1.0 + (-v).exp()))
+    }
+
+    fn sigmoid_derivative(x: &Array1<f64>) -> Array1<f64> {
+        let clipped = x.mapv(|v| v.max(-10.0).min(10.0));
+        let s = Self::sigmoid(&clipped);
+        &s * &(1.0 - &s)
+    }
+    
 }
 
 fn exponential_decay(epoch: usize, initial_lr: f64, decay_rate: f64) -> f64 {
@@ -223,129 +244,55 @@ fn exponential_decay(epoch: usize, initial_lr: f64, decay_rate: f64) -> f64 {
 fn main() {
     let inputs = array![[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
 
-    let logic_gates = vec![
-        (array![[0.0], [0.0], [0.0], [1.0]], "AND"),
-        (array![[0.0], [1.0], [1.0], [1.0]], "OR"),
-        (array![[0.0], [1.0], [1.0], [0.0]], "XOR"),
-        (array![[1.0], [0.0], [0.0], [1.0]], "XNOR"),
-        (array![[1.0], [1.0], [1.0], [0.0]], "NAND"),
-        (array![[1.0], [0.0], [0.0], [0.0]], "NOR"),
+    // A single array to hold the outputs for all gates
+    let outputs = array![
+        [0.01, 0.01, 0.01, 0.99, 0.99, 0.99], // input: [0, 0]
+        [0.01, 0.99, 0.99, 0.01, 0.99, 0.01], // input: [0, 1]
+        [0.01, 0.99, 0.99, 0.01, 0.99, 0.01], // input: [1, 0]
+        [0.99, 0.99, 0.01, 0.99, 0.01, 0.01], // input: [1, 1]
     ];
 
-    let mut nn = NeuralNetwork::new(vec![2, 4, 1]);
+    let mut nn = NeuralNetwork::new(vec![2, 4, 6]);  // 6 outputs: one for each logic gate
 
-    let max_epochs = 10_000;
-    let mut error_threshold = 0.001; //default 0.001
-    let learning_rate = 0.5; //experiment with lowering it down if it fails.
-    let decay_rate = 0.99; //usually between 0 and 1
-    let mut filename = <String>::new();
-    let final_filename ="nn_saved.json".to_string();
-    let mut logic_final_errors: HashMap<String, f64> = HashMap::new();
-    let mut successfull:bool = false;
-    while !successfull{
+    let max_epochs = 5000;
+    let mut error_threshold = 0.01;
+    let learning_rate = 0.5;
+    let decay_rate = 0.99;
+    let final_filename = "nn_saved.json".to_string();
+
+    let mut successfull = false;
+    while !successfull {
         successfull = true;
-        for (outputs, gate_name) in logic_gates.clone() {
-            let oldgate_filename = filename.clone();
-            let mut path = Path::new(&final_filename);
-            if path.exists(){
-                match NeuralNetwork::load_from_file(&final_filename) {
-                    Ok(mut nn) => {
-                        //println!("Successfully loaded the network.");
-                        nn.problem = false; //reinit
-                        error_threshold = 0.01; // still acceptable for retraining (faster)
-                        let final_error = nn.evaluate(&inputs, &outputs);
-                        logic_final_errors.insert(gate_name.to_string(), final_error);
-                        println!("Final error after learning {} gate: {:.6}", gate_name, final_error);
-                        if final_error > error_threshold {
-                            //println!("Re-Training network to learn {} gate:", gate_name);
-                            while !nn.problem {
-                                let mut check_them_all = 1;
-                                nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate);
-                                if !nn.problem {
-                                    //evaluate whether all the answers are within error_threshold.
-                                    for (_gate_name, final_error) in logic_final_errors.clone(){
-                                        if final_error <= error_threshold{
-                                            check_them_all += 1;
-                                        }
-                                    }
-                                    if check_them_all == logic_gates.len(){
-                                        //save and exit....
-                                        if let Err(e) = nn.save_to_file(&final_filename) {
-                                            eprintln!("Failed to save network: {}", e);
-                                        }
-                                        exit(0);
 
-                                    }
-                                    break;
-                                }
-                                println!("Training for {} gate ... in progress!--> Neurons={:?}", gate_name, nn.neuron_counts[1]);
-                            }
-
-                            // Save the neural network's progress after re-training
-                            if let Err(e) = nn.save_to_file(&final_filename) {
-                                eprintln!("Failed to save network: {}", e);
-                            }
-
-                            successfull = false;
-                        }
-                    }
-                    Err(e) => {
-                            eprintln!("Failed to load network: {}", e);
-                    }
-                    
-                }
-            } else {
-                println!("Training network to learn {} gate:", gate_name);
-                while !nn.problem {
-                    nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate);
-                    if !nn.problem {
-                        break;
-                    }
-                    println!("Training for {} gate ... in progress!--> Neurons={:?}", gate_name, nn.neuron_counts[1]);
-                    path = Path::new(&oldgate_filename);
-                    if path.exists(){
-                        match NeuralNetwork::load_from_file(&oldgate_filename) {
-                            Ok(nn_progress) => {
-                                //println!("Successfully loaded the network's last step.");
-                                nn = nn_progress;
-                                nn.problem = false; //reinit.
-                                continue                  
-                            }
-                            Err(e) => {
-                                    eprintln!("Failed to load network: {}", e);
-                            }
-                        }
-                    } else {
-                        nn = NeuralNetwork::new(vec![2, 4, 1]); // Retry
-                    }
-                }
-
-                // Save the neural network after training
-                filename = format!("nn_{}.json", gate_name);
-
-                if let Err(e) = nn.save_to_file(&filename) {
-                    eprintln!("Failed to save network: {}", e);
-                } else {
-                    println!("Network saved to: {}", filename);
-                }
-
-
-            }
+        // Only need the outputs array now, no need to iterate over each logic gate
+        println!("Training network for all logic gates simultaneously...");
         
+        nn.problem = false; // Reset the issue flag
+        while !nn.problem {
+            nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate);
+            if !nn.problem {
+                break;
+            }
+            println!("Training in progress... Neurons={:?}", nn.neuron_counts[1]);
         }
 
-    }
+        // Evaluate the training result for all gates at once
+        let final_error = nn.evaluate(&inputs, &outputs);
+        println!("Final error after training all gates: {:.6}", final_error);
 
-    
-    // final save of the neural network progress...
-    let filename_final = format!("nn_saved.json");
+        if final_error <= error_threshold {
+            println!("Training completed successfully!");
+            successfull = true;
+        } else {
+            println!("Error still too high after training, retraining...");
+            successfull = false;
+        }
 
-    let path = Path::new(&filename_final);
-    if !path.exists(){
-        if let Err(e) = nn.save_to_file(&filename_final) {
+        // Save the final network
+        if let Err(e) = nn.save_to_file(&final_filename) {
             eprintln!("Failed to save network: {}", e);
         } else {
-            println!("Network saved to: {}", filename_final);
+            println!("Network saved to: {}", final_filename);
         }
     }
 }
