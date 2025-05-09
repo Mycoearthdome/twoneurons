@@ -7,11 +7,10 @@ use ndarray_rand::RandomExt;
 use serde::{Serialize, Deserialize};
 use std::fs::File;
 use std::io::{self, Write, Read};
-use std::path::Path;
 use ndarray_rand::rand_distr::{Normal, Distribution};
 use std::process::exit;
-use std::collections::HashMap;
 use rayon::prelude::*;
+use ndarray::{Array1, Array2, Axis, stack};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct NeuralNetwork {
@@ -241,58 +240,193 @@ fn exponential_decay(epoch: usize, initial_lr: f64, decay_rate: f64) -> f64 {
     initial_lr * (decay_rate).powi(epoch as i32)
 }
 
-fn main() {
-    let inputs = array![[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+fn generate_realistic_drone_inputs(num_samples: usize) -> Array2<f64> {
+    let mut rng = StdRng::from_entropy();
 
-    // A single array to hold the outputs for all gates
-    let outputs = array![
-        [0.01, 0.01, 0.01, 0.99, 0.99, 0.99], // input: [0, 0]
-        [0.01, 0.99, 0.99, 0.01, 0.99, 0.01], // input: [0, 1]
-        [0.01, 0.99, 0.99, 0.01, 0.99, 0.01], // input: [1, 0]
-        [0.99, 0.99, 0.01, 0.99, 0.01, 0.01], // input: [1, 1]
-    ];
+    let pos_range = Uniform::new(-1000.0, 1000.0);       // meters
+    let angle_range = Uniform::new(-180.0, 180.0);       // degrees
+    let vel_range = Uniform::new(-30.0, 30.0);           // m/s
+    let acc_range = Uniform::new(-15.0, 15.0);           // m/s²
+    let ang_vel_range = Uniform::new(-300.0, 300.0);     // deg/s
+    let battery_range = Uniform::new(0.0, 1.0);          // normalized
+    let control_range = Uniform::new(0.0, 1.0);          // throttle, etc.
 
-    let mut nn = NeuralNetwork::new(vec![2, 4, 6]);  // 6 outputs: one for each logic gate
+    Array2::from_shape_fn((num_samples, 18), |(_, j)| match j {
+        0..=2 => pos_range.sample(&mut rng),      // x, y, z
+        3..=5 => angle_range.sample(&mut rng),    // roll, pitch, yaw
+        6..=8 => vel_range.sample(&mut rng),      // vx, vy, vz
+        9..=11 => acc_range.sample(&mut rng),     // ax, ay, az
+        12..=14 => ang_vel_range.sample(&mut rng),// ωx, ωy, ωz
+        15 => battery_range.sample(&mut rng),     // battery level
+        16..=17 => control_range.sample(&mut rng),// control inputs (e.g. throttle, pitch)
+        _ => 0.0,
+    })
+}
 
-    let max_epochs = 5000;
-    let mut error_threshold = 0.01;
-    let learning_rate = 0.5;
-    let decay_rate = 0.99;
-    let final_filename = "nn_saved.json".to_string();
+fn generate_realistic_outputs(inputs: &Array2<f64>) -> Array2<f64> {
+    let rows: Vec<Array1<f64>> = inputs.outer_iter().map(|input| {
+        let z = input[2];
+        let vz = input[8];
+        let vx = input[6];
+        let vy = input[7];
+        let ax = input[9];
+        let ay = input[10];
+        let yaw = input[5];
+        let omega_z = input[14];
 
-    let mut successfull = false;
-    while !successfull {
-        successfull = true;
+        let mut throttle = 0.5 + (-z + vz) * 0.01;
+        let mut pitch = 0.5 + (-vx + ax) * 0.01;
+        let mut roll = 0.5 + (-vy + ay) * 0.01;
+        let mut yaw_rate = 0.5 + (-yaw + omega_z) * 0.005;
 
-        // Only need the outputs array now, no need to iterate over each logic gate
-        println!("Training network for all logic gates simultaneously...");
-        
-        nn.problem = false; // Reset the issue flag
-        while !nn.problem {
-            nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate);
-            if !nn.problem {
-                break;
+        for val in [&mut throttle, &mut pitch, &mut roll, &mut yaw_rate] {
+            *val = val.clamp(0.0, 1.0);
+        }
+
+        array![throttle, pitch, roll, yaw_rate]
+    }).collect();
+
+    stack(Axis(0), &rows.iter().map(|x| x.view()).collect::<Vec<_>>()).unwrap()
+}
+
+
+
+fn get_input_feature_ranges() -> Vec<(f64, f64)> {
+    vec![
+        (-1000.0, 1000.0), // x
+        (-1000.0, 1000.0), // y
+        (-1000.0, 1000.0), // z
+        (-180.0, 180.0),   // roll
+        (-180.0, 180.0),   // pitch
+        (-180.0, 180.0),   // yaw
+        (-30.0, 30.0),     // vx
+        (-30.0, 30.0),     // vy
+        (-30.0, 30.0),     // vz
+        (-15.0, 15.0),     // ax
+        (-15.0, 15.0),     // ay
+        (-15.0, 15.0),     // az
+        (-300.0, 300.0),   // ωx
+        (-300.0, 300.0),   // ωy
+        (-300.0, 300.0),   // ωz
+        (0.0, 1.0),        // battery
+        (0.0, 1.0),        // throttle hint
+        (0.0, 1.0),        // pitch hint
+    ]
+}
+
+fn normalize_inputs(inputs: &Array2<f64>) -> Array2<f64> {
+    let ranges = get_input_feature_ranges();
+    let (rows, cols) = inputs.dim();
+    assert_eq!(cols, ranges.len());
+
+    Array2::from_shape_fn((rows, cols), |(i, j)| {
+        let (min, max) = ranges[j];
+        let val = inputs[[i, j]];
+        ((val - min) / (max - min)).clamp(0.0, 1.0)
+    })
+}
+
+fn interpret_control(name: &str, value: f64) -> &'static str {
+    match name {
+        "throttle" => {
+            if value < 0.45 {
+                "reduce lift (descending)"
+            } else if value > 0.55 {
+                "increase lift (ascending)"
+            } else {
+                "maintain altitude (hover)"
             }
-            println!("Training in progress... Neurons={:?}", nn.neuron_counts[1]);
-        }
-
-        // Evaluate the training result for all gates at once
-        let final_error = nn.evaluate(&inputs, &outputs);
-        println!("Final error after training all gates: {:.6}", final_error);
-
-        if final_error <= error_threshold {
-            println!("Training completed successfully!");
-            successfull = true;
-        } else {
-            println!("Error still too high after training, retraining...");
-            successfull = false;
-        }
-
-        // Save the final network
-        if let Err(e) = nn.save_to_file(&final_filename) {
-            eprintln!("Failed to save network: {}", e);
-        } else {
-            println!("Network saved to: {}", final_filename);
-        }
+        },
+        "pitch" => {
+            if value < 0.45 {
+                "tilt backward"
+            } else if value > 0.55 {
+                "tilt forward"
+            } else {
+                "stay level"
+            }
+        },
+        "roll" => {
+            if value < 0.45 {
+                "tilt left"
+            } else if value > 0.55 {
+                "tilt right"
+            } else {
+                "stay level"
+            }
+        },
+        "yaw" => {
+            if value < 0.45 {
+                "rotate counterclockwise"
+            } else if value > 0.55 {
+                "rotate clockwise"
+            } else {
+                "no turn"
+            }
+        },
+        _ => "unknown"
     }
+}
+
+fn main() {
+    let num_samples = 1000;
+    let input_dim = 18;
+    let output_dim = 4; // Example: motor command outputs (throttle, yaw, pitch, roll)
+
+    // Simulate realistic drone inputs
+    let raw_inputs = generate_realistic_drone_inputs(num_samples);
+    let inputs = normalize_inputs(&raw_inputs); // normalized to [0.0, 1.0]
+
+    // Simulate ideal motor command outputs for learning
+    let outputs = generate_realistic_outputs(&inputs);
+
+
+    let mut nn = NeuralNetwork::new(vec![input_dim, 12, 8, output_dim]);
+
+    let max_epochs = 10_000;
+    let learning_rate = 0.01;
+    let error_threshold = 0.001;
+    let decay_rate = 0.99;
+    let final_filename = "realistic_drone_nn.json";
+
+    println!("Training neural network with realistic drone flight data...");
+    nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate);
+
+    let final_error = nn.evaluate(&inputs, &outputs);
+    // Convert final error to RMSE (Root Mean Squared Error)
+    let rmse = final_error.sqrt();
+    
+    // Convert RMSE to percentage (assuming outputs are normalized between 0 and 1)
+    let rmse_percentage = rmse * 100.0;
+
+    println!("Final training error (RMSE in percentage): {:.2}%", rmse_percentage);
+
+    if let Err(e) = nn.save_to_file(final_filename) {
+        eprintln!("Failed to save network: {}", e);
+    } else {
+        println!("Network saved to: {}", final_filename);
+    }
+
+    // example Prediction
+    let sample_input = inputs.row(0).to_owned();
+    let result = nn.forward(&sample_input);
+    println!("\n--- Sample Prediction ---");
+    //println!("Sample normalized input (telemetry): {:?}", sample_input);
+    println!("Predicted control output (normalized values in [0.0 - 1.0]):");
+    println!("  Throttle : {:.4} → {}",
+        result[0],
+        interpret_control("throttle", result[0])
+    );
+    println!("  Pitch    : {:.4} → {}",
+        result[1],
+        interpret_control("pitch", result[1])
+    );
+    println!("  Roll     : {:.4} → {}",
+        result[2],
+        interpret_control("roll", result[2])
+    );
+    println!("  Yaw Rate : {:.4} → {}",
+        result[3],
+        interpret_control("yaw", result[3])
+    );
 }
