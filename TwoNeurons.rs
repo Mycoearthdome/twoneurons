@@ -12,6 +12,7 @@ use ndarray_rand::rand_distr::{Normal, Distribution};
 use std::process::exit;
 use rayon::prelude::*;
 use ndarray::{Array1, Array2, Axis, stack};
+use std::path::Path;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct NeuralNetwork {
@@ -419,60 +420,72 @@ fn main() {
     let inputs = normalize_inputs(&raw_inputs);
     let outputs = generate_outputs_to_fly_toward_laser(&raw_inputs);
 
-    let mut nn = NeuralNetwork::new(vec![input_dim, 16, 12, output_dim]);
-
-    let max_epochs = 10_000;
-    let learning_rate = 0.001;
-    let error_threshold = 0.01;
-    let decay_rate = 0.995;
-    let patience_limit = 200;
-    let max_neurons = 64;
-    let mut rmse_percentage = 100.0;
-    let target_rmse = 5.0;
     let final_filename = "realistic_drone_laser_nn.json";
 
-    println!("Training drone to follow IR laser trajectory...");
+    let final_filename_path = Path::new(final_filename);
 
-    while rmse_percentage > target_rmse{
-            nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate, patience_limit, max_neurons);
-        
-            let final_error = nn.evaluate(&inputs, &outputs);
-        
-            // Convert final error to RMSE (Root Mean Squared Error)
-            let rmse = final_error.sqrt();
-                
-            // Convert RMSE to percentage (assuming outputs are normalized between 0 and 1)
-            rmse_percentage = rmse * 100.0;
-        
-            println!("Training in progress ... {:.2}% target at {:.2}%", rmse_percentage, target_rmse);
-    }
+    if !final_filename_path.exists(){
 
-    if let Err(e) = nn.save_to_file(final_filename) {
-        eprintln!("Failed to save network: {}", e);
+        let mut nn = NeuralNetwork::new(vec![input_dim, 16, 12, output_dim]);
+
+        let max_epochs = 10_000;
+        let learning_rate = 0.001;
+        let error_threshold = 0.01;
+        let decay_rate = 0.995;
+        let patience_limit = 200;
+        let max_neurons = 64;
+        let mut rmse_percentage = 100.0;
+        let target_rmse = 5.0;
+        
+
+        println!("Training drone to follow IR laser trajectory ...");
+
+        while rmse_percentage > target_rmse{
+                nn.train(&inputs, &outputs, max_epochs, learning_rate, error_threshold, decay_rate, patience_limit, max_neurons);
+            
+                let final_error = nn.evaluate(&inputs, &outputs);
+            
+                // Convert final error to RMSE (Root Mean Squared Error)
+                let rmse = final_error.sqrt();
+                    
+                // Convert RMSE to percentage (assuming outputs are normalized between 0 and 1)
+                rmse_percentage = rmse * 100.0;
+            
+                println!("Training in progress ... {:.2}% target at {:.2}%", rmse_percentage, target_rmse);
+        }
+
+        if let Err(e) = nn.save_to_file(final_filename) {
+            eprintln!("Failed to save network: {}", e);
+        } else {
+            println!("Network saved to: {}", final_filename);
+        }
     } else {
-        println!("Network saved to: {}", final_filename);
-    }
+        println!("Homing to target ...");
 
-    // example Prediction
-    let sample_input = inputs.row(0).to_owned();
-    let result = nn.forward(&sample_input);
-    println!("\n--- Sample Prediction ---");
-    //println!("Sample normalized input (telemetry): {:?}", sample_input);
-    println!("Predicted control output (normalized values in [0.0 - 1.0]):");
-    println!("  Throttle : {:.4} → {}",
-        result[0],
-        interpret_control("throttle", result[0])
+        let nn = NeuralNetwork::load_from_file(final_filename).expect("Unable to load Neural Nerwork!");
+
+        // example Prediction
+        let sample_input = inputs.row(0).to_owned();
+        let result = nn.forward(&sample_input);
+        println!("\n--- Sample Prediction ---");
+        //println!("Sample normalized input (telemetry): {:?}", sample_input);
+        println!("Predicted control output (normalized values in [0.0 - 1.0]):");
+        println!("  Throttle : {:.4} → {}",
+            result[0],
+            interpret_control("throttle", result[0])
+        );
+        println!("  Pitch    : {:.4} → {}",
+            result[1],
+            interpret_control("pitch", result[1])
+        );
+        println!("  Roll     : {:.4} → {}",
+            result[2],
+            interpret_control("roll", result[2])
+        );
+        println!("  Yaw Rate : {:.4} → {}",
+            result[3],
+            interpret_control("yaw", result[3])
     );
-    println!("  Pitch    : {:.4} → {}",
-        result[1],
-        interpret_control("pitch", result[1])
-    );
-    println!("  Roll     : {:.4} → {}",
-        result[2],
-        interpret_control("roll", result[2])
-    );
-    println!("  Yaw Rate : {:.4} → {}",
-        result[3],
-        interpret_control("yaw", result[3])
-    );
+    }
+    
 }
